@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import urllib.parse
-from typing import Dict, Any, Optional, Set, List
+from typing import Dict, Any, Optional, Set, List, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
@@ -24,6 +24,14 @@ logging.basicConfig(
 
 STANDARD_EMAIL_REGEX = re.compile(
     r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", re.IGNORECASE
+)
+
+LINKEDIN_PROFILE_REGEX = re.compile(
+    r"linkedin\.com/in/([a-zA-Z0-9%_-]+)", re.IGNORECASE
+)
+
+LINKEDIN_COMPANY_REGEX = re.compile(
+    r"linkedin\.com/company/([a-zA-Z0-9%_-]+)", re.IGNORECASE
 )
 
 LEGAL_SUFFIXES = re.compile(
@@ -67,7 +75,7 @@ def is_self_employed(company: str) -> bool:
     }
 
 
-class SearchAndVerifyEmailPipeline:
+class SearchAndVerifyPipeline:
     def __init__(self, timeout_seconds: int = 5):
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self._mx_cache: Dict[str, List[str]] = {}
@@ -140,7 +148,7 @@ class SearchAndVerifyEmailPipeline:
 
         return emails
 
-    async def search_and_extract_candidates(
+    async def search_and_extract_email_candidates(
         self, session: aiohttp.ClientSession, name: str, company: str
     ) -> Set[str]:
         """Searches DuckDuckGo for the person + company and extracts raw candidate emails."""
@@ -165,11 +173,8 @@ class SearchAndVerifyEmailPipeline:
             async with session.post(search_url, data=post_data, headers=post_headers, timeout=self.timeout) as resp:
                 if resp.status == 200:
                     html_text = await resp.text()
-                    # 1. Extract from search result snippets directly
-                    snippet_emails = self.extract_clean_emails(html_text)
-                    candidates.update(snippet_emails)
+                    candidates.update(self.extract_clean_emails(html_text))
 
-                    # 2. Fetch top 2 organic result URLs
                     soup = BeautifulSoup(html_text, "html.parser")
                     links = soup.find_all("a", class_="result__url")[:2]
 
@@ -193,19 +198,102 @@ class SearchAndVerifyEmailPipeline:
 
         return candidates
 
+    async def search_linkedin_url(
+        self, session: aiohttp.ClientSession, query: str, is_company: bool = False
+    ) -> Optional[str]:
+        """Queries search engine for a clean LinkedIn personal or company URL."""
+        search_url = "https://html.duckduckgo.com/html/"
+        post_data = {"q": query}
+        post_headers = {
+            **HEADERS,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://html.duckduckgo.com",
+            "Referer": "https://html.duckduckgo.com/",
+        }
+
+        try:
+            async with session.post(search_url, data=post_data, headers=post_headers, timeout=self.timeout) as resp:
+                if resp.status == 200:
+                    html_text = await resp.text()
+                    soup = BeautifulSoup(html_text, "html.parser")
+                    links = soup.find_all("a", class_="result__url")
+
+                    for link in links:
+                        raw_href = link.get("href", "")
+                        actual_url = (
+                            urllib.parse.unquote(raw_href.split("uddg=")[1].split("&")[0])
+                            if "uddg=" in raw_href
+                            else raw_href
+                        )
+
+                        if is_company:
+                            match = LINKEDIN_COMPANY_REGEX.search(actual_url)
+                            if match:
+                                slug = match.group(1).rstrip("/")
+                                return f"https://www.linkedin.com/company/{slug}"
+                        else:
+                            match = LINKEDIN_PROFILE_REGEX.search(actual_url)
+                            if match:
+                                slug = match.group(1).rstrip("/")
+                                return f"https://www.linkedin.com/in/{slug}"
+        except Exception:
+            pass
+        return None
+
+    async def resolve_linkedin_url(
+        self, session: aiohttp.ClientSession, row: Dict[str, Any]
+    ) -> Tuple[Optional[str], str]:
+        """Resolves canonical personal or company LinkedIn URL."""
+        norm_url = str(row.get("linkedin_normalized_url", "")).strip()
+        verified = str(row.get("linkedin_verified", "")).strip().lower()
+        name = str(row.get("name", "")).strip()
+        company = str(row.get("company", "")).strip()
+
+        # Step 1: Keep original if verified
+        if norm_url and norm_url.lower() != "nan" and verified == "yes":
+            return norm_url, "LINKEDIN_ORIGINAL_VALID"
+
+        clean_name = re.sub(r"[^a-zA-Z\s]", "", name).strip()
+        clean_comp = sanitize_company_name(company)
+
+        if not clean_name:
+            return None, "LINKEDIN_UNRESOLVED"
+
+        # Step 2: Search for personal LinkedIn profile
+        query_profile = (
+            f'"{clean_name}" "{clean_comp}" site:linkedin.com/in/'
+            if clean_comp else f'"{clean_name}" site:linkedin.com/in/'
+        )
+        profile_url = await self.search_linkedin_url(session, query_profile, is_company=False)
+        if profile_url:
+            return profile_url, "LINKEDIN_PROFILE_RESOLVED"
+
+        # Step 3: Search for company LinkedIn page as fallback
+        if clean_comp and not is_self_employed(company):
+            query_company = f'"{clean_comp}" site:linkedin.com/company/'
+            company_url = await self.search_linkedin_url(session, query_company, is_company=True)
+            if company_url:
+                return company_url, "LINKEDIN_COMPANY_PAGE_RESOLVED"
+
+        return None, "LINKEDIN_UNRESOLVED"
+
     async def process_row(self, row: Dict[str, Any], session: aiohttp.ClientSession) -> Dict[str, Any]:
         record = dict(row)
         email = str(row.get("email", "")).strip()
         name = str(row.get("name", "")).strip()
         company = str(row.get("company", "")).strip()
 
-        # Step 0: Filter self-employed
+        # --- A. LINKEDIN ID RESOLUTION ---
+        resolved_li_url, li_status = await self.resolve_linkedin_url(session, row)
+        record["final_linkedin_url"] = resolved_li_url
+        record["linkedin_verification_status"] = li_status
+
+        # --- B. EMAIL VERIFICATION & ENRICHMENT ---
         if is_self_employed(company):
             record["final_email"] = None
-            record["verification_status"] = "SELF_EMPLOYED_NO_DOMAIN"
+            record["email_verification_status"] = "SELF_EMPLOYED_NO_DOMAIN"
             return record
 
-        # Step 1: Check existing email (DNS MX + SMTP Handshake)
         if email and email.lower() != "nan" and "@" in email:
             original_domain = email.split("@")[-1].strip().lower()
             mx_hosts = await self.get_mx_records(original_domain)
@@ -214,46 +302,46 @@ class SearchAndVerifyEmailPipeline:
                 smtp_result = await self.verify_smtp_mailbox(email, mx_hosts[0])
                 if smtp_result is True:
                     record["final_email"] = email
-                    record["verification_status"] = "SMTP_HANDSHAKE_VERIFIED"
+                    record["email_verification_status"] = "SMTP_HANDSHAKE_VERIFIED"
                     return record
                 else:
                     record["final_email"] = email
-                    record["verification_status"] = "MX_VERIFIED"
+                    record["email_verification_status"] = "MX_VERIFIED"
                     return record
 
         logging.info(f"MX failed for {email}. Executing search extraction for {name} ({company})...")
 
-        # Step 2: Search engine candidate extraction
-        candidates = await self.search_and_extract_candidates(session, name, company)
+        candidates = await self.search_and_extract_email_candidates(session, name, company)
 
-        # Step 3: STRICT VERIFICATION GATE for search candidates
         for candidate in candidates:
             cand_domain = candidate.split("@")[-1].strip().lower()
             mx_hosts = await self.get_mx_records(cand_domain)
 
             if mx_hosts:
-                # Run direct SMTP handshake test
                 smtp_ok = await self.verify_smtp_mailbox(candidate, mx_hosts[0])
                 if smtp_ok is True:
                     record["final_email"] = candidate
-                    record["verification_status"] = "SEARCH_SMTP_VERIFIED"
+                    record["email_verification_status"] = "SEARCH_SMTP_VERIFIED"
                     return record
                 elif smtp_ok is None:
-                    # If Port 25 is inconclusive/blocked, accept ONLY if candidate domain matches company
                     clean_comp = re.sub(r"[^a-zA-Z0-9]", "", company).lower()
                     if clean_comp and clean_comp in cand_domain.replace(".", ""):
                         record["final_email"] = candidate
-                        record["verification_status"] = "SEARCH_SCRAPED_MX_VERIFIED"
+                        record["email_verification_status"] = "SEARCH_SCRAPED_MX_VERIFIED"
                         return record
 
-        # Strict Fallback: Leave blank if no candidate passed verification
         record["final_email"] = None
-        record["verification_status"] = "UNRESOLVED"
+        record["email_verification_status"] = "UNRESOLVED"
         return record
 
 
 async def run_pipeline(input_file: str, output_file: str, batch_size: int = 5):
-    logging.info(f"Starting Search & Strict Verification Pipeline on: {input_file}")
+    logging.info(f"Starting Pipeline on: {input_file}")
+
+    # Ensure output directory exists
+    out_dir = os.path.dirname(output_file)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     if os.path.exists(output_file):
         os.remove(output_file)
@@ -264,7 +352,7 @@ async def run_pipeline(input_file: str, output_file: str, batch_size: int = 5):
         df = pd.read_csv(input_file)
 
     records = df.to_dict(orient="records")
-    pipeline = SearchAndVerifyEmailPipeline()
+    pipeline = SearchAndVerifyPipeline()
     total_batches = (len(records) + batch_size - 1) // batch_size
 
     connector = aiohttp.TCPConnector(limit=batch_size, ssl=False)
@@ -277,7 +365,6 @@ async def run_pipeline(input_file: str, output_file: str, batch_size: int = 5):
             tasks = [pipeline.process_row(row, session) for row in batch]
             batch_results = await asyncio.gather(*tasks)
 
-            # Append batch directly to disk
             batch_df = pd.DataFrame(batch_results)
             is_first_batch = (i == 0)
             batch_df.to_csv(
