@@ -1,3 +1,28 @@
+# Virtual Environments
 .venv/
-.env
+venv/
+ENV/
+env/
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Local Pipeline Caches & Databases
+.cache/
+*.db
+*.sqlite3
+
+# Runtime Logs
+logs/
 *.log
+
+# Environment & Secrets
+.env
+.env.local
+
+# Output Datasets (Keep raw data versioned or ignored as needed)
+data/processed/
+*.csv.tmp
